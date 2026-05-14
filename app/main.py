@@ -6,7 +6,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import PyMongoError
 
@@ -122,11 +122,22 @@ def _analytics_report(limit_recentes: int) -> dict[str, Any]:
     ultimas_partidas: list[dict[str, Any]] = []
     for d in coll.find({}).sort("timestamp", -1).limit(limit_recentes):
         ts = d.get("timestamp")
+        b_raw = d.get("build")
+        build_out: int | None
+        if b_raw is None:
+            build_out = None
+        else:
+            try:
+                build_out = int(b_raw)
+            except (TypeError, ValueError):
+                build_out = None
         ultimas_partidas.append(
             {
                 "id": str(d["_id"]),
                 "ip": d.get("ip"),
                 "device": d.get("device"),
+                "personagem": d.get("personagem"),
+                "build": build_out,
                 "pontuacao": int(d.get("pontuacao", 0)),
                 "timestamp": _iso_utc(ts) if ts is not None else None,
             }
@@ -172,6 +183,26 @@ class PartidaCreate(BaseModel):
         max_length=128,
         description="Origem: local, navegador_pc, navegador_celular, etc.",
     )
+    personagem: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Identificador do personagem usado na partida (ex.: id em game_config).",
+    )
+    build: int | None = Field(
+        default=None,
+        ge=0,
+        description="Número de build do cliente (ex.: CI / build_params.json).",
+    )
+
+    @field_validator("personagem", mode="before")
+    @classmethod
+    def _personagem_strip(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return None
 
 
 @app.get("/health")
@@ -209,7 +240,7 @@ def total_contador():
 def get_analytics(
     limit: int = Query(20, ge=1, le=100, description="Número de partidas recentes no relatório"),
 ):
-    """Relatório agregado: totais, janelas 24h/7d, estatísticas de pontuação e repartição por device."""
+    """Relatório agregado: totais, janelas 24h/7d, estatísticas de pontuação, repartição por device e últimas partidas (com personagem/build quando existirem)."""
     try:
         return _analytics_report(limit_recentes=limit)
     except PyMongoError as e:
@@ -218,14 +249,18 @@ def get_analytics(
 
 @app.post("/partidas")
 def registar_partida(payload: PartidaCreate, request: Request):
-    """Grava ip (servidor), device e pontuação enviados pelo cliente; timestamp em UTC."""
+    """Grava ip (servidor), device, pontuação e opcionalmente personagem/build; timestamp em UTC."""
     try:
-        doc = {
+        doc: dict[str, Any] = {
             "ip": _client_ip(request),
             "device": payload.device,
             "pontuacao": payload.pontuacao,
             "timestamp": datetime.now(timezone.utc),
         }
+        if payload.personagem is not None:
+            doc["personagem"] = payload.personagem
+        if payload.build is not None:
+            doc["build"] = payload.build
         result = _collection_partidas().insert_one(doc)
         return {"id": str(result.inserted_id)}
     except PyMongoError as e:
