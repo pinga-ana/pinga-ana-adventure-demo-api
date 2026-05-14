@@ -1,10 +1,10 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pymongo import MongoClient, ReturnDocument
@@ -50,6 +50,101 @@ def _collection_contador():
 def _collection_partidas():
     name = os.environ.get("MONGODB_PARTIDAS_COLLECTION", "partidas")
     return _db()[name]
+
+
+def _iso_utc(dt: Any) -> str:
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    return str(dt)
+
+
+def _analytics_report(limit_recentes: int) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(days=1)
+    week_ago = now - timedelta(days=7)
+    coll = _collection_partidas()
+
+    contador_doc = _collection_contador().find_one({"_id": CONTADOR_ID})
+    invoc = int(contador_doc["valor"]) if contador_doc else 0
+
+    total = coll.count_documents({})
+    ultimas_24h = coll.count_documents({"timestamp": {"$gte": day_ago}})
+    ultimos_7d = coll.count_documents({"timestamp": {"$gte": week_ago}})
+
+    agg_global = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": None,
+                        "max_p": {"$max": "$pontuacao"},
+                        "avg_p": {"$avg": "$pontuacao"},
+                    }
+                }
+            ]
+        )
+    )
+    row_g = agg_global[0] if agg_global else {}
+    max_p = int(row_g["max_p"]) if row_g.get("max_p") is not None else 0
+    avg_p = round(float(row_g["avg_p"]), 2) if row_g.get("avg_p") is not None else 0.0
+
+    por_device_raw = list(
+        coll.aggregate(
+            [
+                {
+                    "$group": {
+                        "_id": "$device",
+                        "partidas": {"$sum": 1},
+                        "pontuacao_maxima": {"$max": "$pontuacao"},
+                        "pontuacao_media": {"$avg": "$pontuacao"},
+                    }
+                },
+                {"$sort": {"partidas": -1}},
+            ]
+        )
+    )
+    por_device: list[dict[str, Any]] = []
+    for r in por_device_raw:
+        pm = r.get("pontuacao_media")
+        por_device.append(
+            {
+                "device": r.get("_id") or "unknown",
+                "partidas": int(r.get("partidas", 0)),
+                "pontuacao_maxima": int(r["pontuacao_maxima"])
+                if r.get("pontuacao_maxima") is not None
+                else 0,
+                "pontuacao_media": round(float(pm), 2) if pm is not None else 0.0,
+            }
+        )
+
+    ultimas_partidas: list[dict[str, Any]] = []
+    for d in coll.find({}).sort("timestamp", -1).limit(limit_recentes):
+        ts = d.get("timestamp")
+        ultimas_partidas.append(
+            {
+                "id": str(d["_id"]),
+                "ip": d.get("ip"),
+                "device": d.get("device"),
+                "pontuacao": int(d.get("pontuacao", 0)),
+                "timestamp": _iso_utc(ts) if ts is not None else None,
+            }
+        )
+
+    return {
+        "gerado_em": now.isoformat(),
+        "contador_invocacoes": invoc,
+        "partidas": {
+            "total": total,
+            "ultimas_24h": ultimas_24h,
+            "ultimos_7_dias": ultimos_7d,
+            "pontuacao_maxima": max_p,
+            "pontuacao_media": avg_p,
+            "por_device": por_device,
+        },
+        "ultimas_partidas": ultimas_partidas,
+    }
 
 
 def _client_ip(request: Request) -> str:
@@ -106,6 +201,17 @@ def total_contador():
         doc = _collection_contador().find_one({"_id": CONTADOR_ID})
         valor = int(doc["valor"]) if doc else 0
         return {"total": valor}
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/analytics")
+def get_analytics(
+    limit: int = Query(20, ge=1, le=100, description="Número de partidas recentes no relatório"),
+):
+    """Relatório agregado: totais, janelas 24h/7d, estatísticas de pontuação e repartição por device."""
+    try:
+        return _analytics_report(limit_recentes=limit)
     except PyMongoError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
