@@ -13,6 +13,7 @@ from pymongo.errors import PyMongoError
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 CONTADOR_ID = "singleton"
+TOP_RECORDS_LIMIT = 10
 
 _mongo: Optional[MongoClient] = None
 
@@ -158,6 +159,44 @@ def _analytics_report(limit_recentes: int) -> dict[str, Any]:
     }
 
 
+def _top_records(limit: int) -> list[dict[str, Any]]:
+    coll = _collection_partidas()
+    out: list[dict[str, Any]] = []
+    for d in coll.find({}).sort("pontuacao", -1).limit(limit):
+        ts = d.get("timestamp")
+        nome_raw = d.get("nome")
+        nome = nome_raw.strip() if isinstance(nome_raw, str) and nome_raw.strip() else None
+        out.append(
+            {
+                "id": str(d["_id"]),
+                "nome": nome,
+                "personagem": d.get("personagem"),
+                "pontuacao": int(d.get("pontuacao", 0)),
+                "timestamp": _iso_utc(ts) if ts is not None else None,
+            }
+        )
+    return out
+
+
+def _score_qualifies_for_top(pontuacao: int, limit: int = TOP_RECORDS_LIMIT) -> dict[str, Any]:
+    if pontuacao <= 0:
+        return {"qualifica": False, "limite": limit, "pontuacao_minima": None}
+    coll = _collection_partidas()
+    total = coll.count_documents({})
+    if total < limit:
+        return {"qualifica": True, "limite": limit, "pontuacao_minima": 0}
+    cursor = coll.find({}).sort("pontuacao", -1).skip(limit - 1).limit(1)
+    row = next(cursor, None)
+    if row is None:
+        return {"qualifica": True, "limite": limit, "pontuacao_minima": 0}
+    min_score = int(row.get("pontuacao", 0))
+    return {
+        "qualifica": pontuacao >= min_score,
+        "limite": limit,
+        "pontuacao_minima": min_score,
+    }
+
+
 def _client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
@@ -193,10 +232,25 @@ class PartidaCreate(BaseModel):
         ge=0,
         description="Número de build do cliente (ex.: CI / build_params.json).",
     )
+    nome: str | None = Field(
+        default=None,
+        max_length=24,
+        description="Nome do jogador (ex.: recorde no top 10).",
+    )
 
     @field_validator("personagem", mode="before")
     @classmethod
     def _personagem_strip(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return None
+
+    @field_validator("nome", mode="before")
+    @classmethod
+    def _nome_strip(cls, v: object) -> str | None:
         if v is None:
             return None
         if isinstance(v, str):
@@ -247,6 +301,39 @@ def get_analytics(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/records/top")
+def get_top_records(
+    limit: int = Query(
+        TOP_RECORDS_LIMIT,
+        ge=1,
+        le=50,
+        description="Número de melhores pontuações (predefinição: top 10).",
+    ),
+):
+    """Melhores pontuações ordenadas por score decrescente."""
+    try:
+        return {"limite": limit, "records": _top_records(limit)}
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/records/qualifica")
+def record_qualifica(
+    pontuacao: int = Query(..., ge=0, description="Pontuação a verificar para o top 10."),
+    limit: int = Query(
+        TOP_RECORDS_LIMIT,
+        ge=1,
+        le=50,
+        description="Tamanho do ranking considerado (predefinição: 10).",
+    ),
+):
+    """Indica se a pontuação entra no top N actual."""
+    try:
+        return _score_qualifies_for_top(pontuacao, limit=limit)
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.post("/partidas")
 def registar_partida(payload: PartidaCreate, request: Request):
     """Grava ip (servidor), device, pontuação e opcionalmente personagem/build; timestamp em UTC."""
@@ -261,6 +348,8 @@ def registar_partida(payload: PartidaCreate, request: Request):
             doc["personagem"] = payload.personagem
         if payload.build is not None:
             doc["build"] = payload.build
+        if payload.nome is not None:
+            doc["nome"] = payload.nome
         result = _collection_partidas().insert_one(doc)
         return {"id": str(result.inserted_id)}
     except PyMongoError as e:
